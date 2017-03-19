@@ -95,6 +95,7 @@ def submitJob[T, U](
 
 submitJob方法中首先根据输入的rdd得到最大分区的数目，然后做一个正确性判断，之后通过nextJobId得到当前任务的编号。接下来，如果输入的分区数目为0，则表明没有要计算的数据，可以直接返回；否则创建一个新的JobWaiter对象，主要将resultHandler传入，这样，在一个任务完成之后，可以调用taskSucceeded方法对结果进行处理。
 
+
 ```scala
 private[spark] class JobWaiter[T](
     dagScheduler: DAGScheduler,
@@ -120,9 +121,70 @@ private[spark] class JobWaiter[T](
       logWarning("Ignore failure", exception)
     }
   }
-
 }
 ```
+
+对于创建好的JobWaiter，根据DAGSchedulerEvent中定义的事件类型创建“提交任务事件”，也就是代码里面看到的
+
+```
+JobSubmitted(jobId, rdd, func2, partitions.toArray, callSite,
+   waiter, SerializationUtils.clone(properties))
+```
+
+
+之后通过DAGScheduler的内部类DAGSchedulerEventProcessLoop进行消息传递，DAGSchedulerEventProcessLoop继承了EventLoop，设计了针对接收到的不同事件的处理方法
+
+
+```scala
+private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler)
+  extends EventLoop[DAGSchedulerEvent]("dag-scheduler-event-loop") with Logging {
+
+  private[this] val timer = dagScheduler.metricsSource.messageProcessingTimer
+
+  /**
+   * The main event loop of the DAG scheduler.
+   */
+  override def onReceive(event: DAGSchedulerEvent): Unit = {
+    val timerContext = timer.time()
+    try {
+      doOnReceive(event)
+    } finally {
+      timerContext.stop()
+    }
+  }
+
+  private def doOnReceive(event: DAGSchedulerEvent): Unit = event match {
+    case JobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties) =>
+      dagScheduler.handleJobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties)
+    /*
+    ... ignore some codes
+    */
+
+    case ResubmitFailedStages =>
+      dagScheduler.resubmitFailedStages()
+  }
+
+  override def onError(e: Throwable): Unit = {
+    logError("DAGSchedulerEventProcessLoop failed; shutting down SparkContext", e)
+    try {
+      dagScheduler.doCancelAllJobs()
+    } catch {
+      case t: Throwable => logError("DAGScheduler failed to cancel all jobs.", t)
+    }
+    dagScheduler.sc.stopInNewThread()
+  }
+
+  override def onStop(): Unit = {
+    // Cancel any active jobs in postStop hook
+    dagScheduler.cleanUpAfterSchedulerStop()
+  }
+}
+```
+
+可以发现，尽管接收到了处理的消息，但是具体处理的方法仍然在DAGScheduler中完成，对于JobSubmitted事件，调用handleJobSubmitted方法
+
+// TODO 2017-3-19
+
 
 ```Scala
 private[scheduler] def handleJobSubmitted(jobId: Int,
