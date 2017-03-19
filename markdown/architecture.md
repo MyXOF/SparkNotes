@@ -1,8 +1,33 @@
-# 概述
+# 架构
 
 
+## 调度
 
+首先，当触发了rdd的action操作之后。将隐式的调用SparkContext中的runJob方法，这样便开始了整个调度过程
 
-具体的看梳理一下Spark作业调度的流程，当action操作触发之后，在上次action之后的动作和当前action动作之间构成了一个job，Spark隐性的提交了该作业，通过触发SparkContext的runJob，然后再提交给DAGScheduler中的runJob方法
+```scala
+/**
+ * Run a function on a given set of partitions in an RDD and pass the results to the given
+ * handler function. This is the main entry point for all actions in Spark.
+ */
+def runJob[T, U: ClassTag](
+    rdd: RDD[T],
+    func: (TaskContext, Iterator[T]) => U,
+    partitions: Seq[Int],
+    resultHandler: (Int, U) => Unit): Unit = {
+  if (stopped.get()) {
+    throw new IllegalStateException("SparkContext has been shutdown")
+  }
+  val callSite = getCallSite
+  val cleanedFunc = clean(func)
+  logInfo("Starting job: " + callSite.shortForm)
+  if (conf.getBoolean("spark.logLineage", false)) {
+    logInfo("RDD's recursive dependencies:\n" + rdd.toDebugString)
+  }
+  dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, resultHandler, localProperties.get)
+  progressBar.foreach(_.finishAll())
+  rdd.doCheckpoint()
+}
+```
 
-DAGScheduler中的runJob会调用submitJob方法来提交作业，这里会发生阻塞，知道返回作业完成或失败的结果。在submitJob方法里头，创建JobWaiter对象，并借助内部的消息处理进行吧这个对象发送给DAGScheduler的内部类DAGSchedulerEventProcessLoop进行处理，最后在DAGSchedulerEventProcessLoop消息接收方法OnReceive中，接收到JobSubmitted样例完成模式匹配之后，继续调用DAGScheduler的handleJobSubmitted方法来提交作业
+从上述代码可以看到，
