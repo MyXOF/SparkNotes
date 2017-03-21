@@ -183,9 +183,6 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
 
 可以发现，尽管接收到了处理的消息，但是具体处理的方法仍然在DAGScheduler中完成，对于JobSubmitted事件，调用handleJobSubmitted方法
 
-// TODO 2017-3-19
-
-
 ```Scala
 private[scheduler] def handleJobSubmitted(jobId: Int,
     finalRDD: RDD[_],
@@ -227,6 +224,129 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
 
 ```
 
+handleJobSubmitted方法里面首先根据输入的rdd为根节点，广度优先遍历整个rdd依赖树，并按照宽依赖进行切分，划分成若干个Stage
+
+
+```scala
+private def createResultStage(
+    rdd: RDD[_],
+    func: (TaskContext, Iterator[_]) => _,
+    partitions: Array[Int],
+    jobId: Int,
+    callSite: CallSite): ResultStage = {
+  val parents = getOrCreateParentStages(rdd, jobId)
+  val id = nextStageId.getAndIncrement()
+  val stage = new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
+  stageIdToStage(id) = stage
+  updateJobIdStageIdMaps(jobId, stage)
+  stage
+}
+```
+
+createResultStage方法里面首先需要针对输入的rdd寻找它的依赖，getOrCreateParentStages方法里面
+
+
+```scala
+
+/**
+ * Get or create the list of parent stages for a given RDD.  The new Stages will be created with
+ * the provided firstJobId.
+ */
+private def getOrCreateParentStages(rdd: RDD[_], firstJobId: Int): List[Stage] = {
+  getShuffleDependencies(rdd).map { shuffleDep =>
+    getOrCreateShuffleMapStage(shuffleDep, firstJobId)
+  }.toList
+}
+
+/** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet */
+private def getMissingAncestorShuffleDependencies(
+    rdd: RDD[_]): Stack[ShuffleDependency[_, _, _]] = {
+  val ancestors = new Stack[ShuffleDependency[_, _, _]]
+  val visited = new HashSet[RDD[_]]
+  // We are manually maintaining a stack here to prevent StackOverflowError
+  // caused by recursively visiting
+  val waitingForVisit = new Stack[RDD[_]]
+  waitingForVisit.push(rdd)
+  while (waitingForVisit.nonEmpty) {
+    val toVisit = waitingForVisit.pop()
+    if (!visited(toVisit)) {
+      visited += toVisit
+      getShuffleDependencies(toVisit).foreach { shuffleDep =>
+        if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
+          ancestors.push(shuffleDep)
+          waitingForVisit.push(shuffleDep.rdd)
+        } // Otherwise, the dependency and its ancestors have already been registered.
+      }
+    }
+  }
+  ancestors
+}
+
+/**
+ * Returns shuffle dependencies that are immediate parents of the given RDD.
+ *
+ * This function will not return more distant ancestors.  For example, if C has a shuffle
+ * dependency on B which has a shuffle dependency on A:
+ *
+ * A <-- B <-- C
+ *
+ * calling this function with rdd C will only return the B <-- C dependency.
+ *
+ * This function is scheduler-visible for the purpose of unit testing.
+ */
+private[scheduler] def getShuffleDependencies(
+    rdd: RDD[_]): HashSet[ShuffleDependency[_, _, _]] = {
+  val parents = new HashSet[ShuffleDependency[_, _, _]]
+  val visited = new HashSet[RDD[_]]
+  val waitingForVisit = new Stack[RDD[_]]
+  waitingForVisit.push(rdd)
+  while (waitingForVisit.nonEmpty) {
+    val toVisit = waitingForVisit.pop()
+    if (!visited(toVisit)) {
+      visited += toVisit
+      toVisit.dependencies.foreach {
+        case shuffleDep: ShuffleDependency[_, _, _] =>
+          parents += shuffleDep
+        case dependency =>
+          waitingForVisit.push(dependency.rdd)
+      }
+    }
+  }
+  parents
+}
+
+private def getMissingParentStages(stage: Stage): List[Stage] = {
+  val missing = new HashSet[Stage]
+  val visited = new HashSet[RDD[_]]
+  // We are manually maintaining a stack here to prevent StackOverflowError
+  // caused by recursively visiting
+  val waitingForVisit = new Stack[RDD[_]]
+  def visit(rdd: RDD[_]) {
+    if (!visited(rdd)) {
+      visited += rdd
+      val rddHasUncachedPartitions = getCacheLocs(rdd).contains(Nil)
+      if (rddHasUncachedPartitions) {
+        for (dep <- rdd.dependencies) {
+          dep match {
+            case shufDep: ShuffleDependency[_, _, _] =>
+              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
+              if (!mapStage.isAvailable) {
+                missing += mapStage
+              }
+            case narrowDep: NarrowDependency[_] =>
+              waitingForVisit.push(narrowDep.rdd)
+          }
+        }
+      }
+    }
+  }
+  waitingForVisit.push(stage.rdd)
+  while (waitingForVisit.nonEmpty) {
+    visit(waitingForVisit.pop())
+  }
+  missing.toList
+}
+```
 
 ```Scala
 
