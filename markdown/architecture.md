@@ -16,10 +16,7 @@ def runJob[T, U: ClassTag](
   }
   val callSite = getCallSite
   val cleanedFunc = clean(func)
-  logInfo("Starting job: " + callSite.shortForm)
-  if (conf.getBoolean("spark.logLineage", false)) {
-    logInfo("RDD's recursive dependencies:\n" + rdd.toDebugString)
-  }
+  // ... ignore some codes
   dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, resultHandler, localProperties.get)
   progressBar.foreach(_.finishAll())
   rdd.doCheckpoint()
@@ -141,9 +138,6 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
 
   private[this] val timer = dagScheduler.metricsSource.messageProcessingTimer
 
-  /**
-   * The main event loop of the DAG scheduler.
-   */
   override def onReceive(event: DAGSchedulerEvent): Unit = {
     val timerContext = timer.time()
     try {
@@ -156,10 +150,7 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
   private def doOnReceive(event: DAGSchedulerEvent): Unit = event match {
     case JobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties) =>
       dagScheduler.handleJobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties)
-    /*
-    ... ignore some codes
-    */
-
+    // ... ignore some codes
     case ResubmitFailedStages =>
       dagScheduler.resubmitFailedStages()
   }
@@ -193,8 +184,6 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
     properties: Properties) {
   var finalStage: ResultStage = null
   try {
-    // New stage creation may throw an exception if, for example, jobs are run on a
-    // HadoopRDD whose underlying HDFS files have been deleted.
     finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
   } catch {
     case e: Exception =>
@@ -205,11 +194,7 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
 
   val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
   clearCacheLocs()
-  logInfo("Got job %s (%s) with %d output partitions".format(
-    job.jobId, callSite.shortForm, partitions.length))
-  logInfo("Final stage: " + finalStage + " (" + finalStage.name + ")")
-  logInfo("Parents of final stage: " + finalStage.parents)
-  logInfo("Missing parents: " + getMissingParentStages(finalStage))
+  // ... ignore some codes
 
   val jobSubmissionTime = clock.getTimeMillis()
   jobIdToActiveJob(jobId) = job
@@ -224,7 +209,7 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
 
 ```
 
-handleJobSubmitted方法里面首先根据输入的rdd为根节点，广度优先遍历整个rdd依赖树，并按照宽依赖进行切分，划分成若干个Stage
+handleJobSubmitted方法里面首先根据输入的rdd // TODO
 
 
 ```scala
@@ -241,59 +226,13 @@ private def createResultStage(
   updateJobIdStageIdMaps(jobId, stage)
   stage
 }
-```
 
-createResultStage方法里面首先需要针对输入的rdd寻找它的依赖，getOrCreateParentStages方法里面
-
-
-```scala
-
-/**
- * Get or create the list of parent stages for a given RDD.  The new Stages will be created with
- * the provided firstJobId.
- */
 private def getOrCreateParentStages(rdd: RDD[_], firstJobId: Int): List[Stage] = {
   getShuffleDependencies(rdd).map { shuffleDep =>
     getOrCreateShuffleMapStage(shuffleDep, firstJobId)
   }.toList
 }
 
-/** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet */
-private def getMissingAncestorShuffleDependencies(
-    rdd: RDD[_]): Stack[ShuffleDependency[_, _, _]] = {
-  val ancestors = new Stack[ShuffleDependency[_, _, _]]
-  val visited = new HashSet[RDD[_]]
-  // We are manually maintaining a stack here to prevent StackOverflowError
-  // caused by recursively visiting
-  val waitingForVisit = new Stack[RDD[_]]
-  waitingForVisit.push(rdd)
-  while (waitingForVisit.nonEmpty) {
-    val toVisit = waitingForVisit.pop()
-    if (!visited(toVisit)) {
-      visited += toVisit
-      getShuffleDependencies(toVisit).foreach { shuffleDep =>
-        if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
-          ancestors.push(shuffleDep)
-          waitingForVisit.push(shuffleDep.rdd)
-        } // Otherwise, the dependency and its ancestors have already been registered.
-      }
-    }
-  }
-  ancestors
-}
-
-/**
- * Returns shuffle dependencies that are immediate parents of the given RDD.
- *
- * This function will not return more distant ancestors.  For example, if C has a shuffle
- * dependency on B which has a shuffle dependency on A:
- *
- * A <-- B <-- C
- *
- * calling this function with rdd C will only return the B <-- C dependency.
- *
- * This function is scheduler-visible for the purpose of unit testing.
- */
 private[scheduler] def getShuffleDependencies(
     rdd: RDD[_]): HashSet[ShuffleDependency[_, _, _]] = {
   val parents = new HashSet[ShuffleDependency[_, _, _]]
@@ -314,87 +253,73 @@ private[scheduler] def getShuffleDependencies(
   }
   parents
 }
+```
 
-private def getMissingParentStages(stage: Stage): List[Stage] = {
-  val missing = new HashSet[Stage]
-  val visited = new HashSet[RDD[_]]
-  // We are manually maintaining a stack here to prevent StackOverflowError
-  // caused by recursively visiting
-  val waitingForVisit = new Stack[RDD[_]]
-  def visit(rdd: RDD[_]) {
-    if (!visited(rdd)) {
-      visited += rdd
-      val rddHasUncachedPartitions = getCacheLocs(rdd).contains(Nil)
-      if (rddHasUncachedPartitions) {
-        for (dep <- rdd.dependencies) {
-          dep match {
-            case shufDep: ShuffleDependency[_, _, _] =>
-              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
-              if (!mapStage.isAvailable) {
-                missing += mapStage
-              }
-            case narrowDep: NarrowDependency[_] =>
-              waitingForVisit.push(narrowDep.rdd)
-          }
+createResultStage方法里面首先需要针对输入的rdd寻找它的依赖，getOrCreateParentStages方法里面先按照getShuffleDependencies，根据输入的RDD按照广度优先的方法，找到第一层的宽依赖，如下图
+
+![](../img/architecture/Spark-DAGScheduler-2.png)
+
+假设图中两两RDD之间均为宽依赖，那么如果RDD A作为getShuffleDependencies函数的输入，那么得到的结果就是包含RDD B和RDD C的集合
+
+```scala
+private def getOrCreateShuffleMapStage(
+    shuffleDep: ShuffleDependency[_, _, _],
+    firstJobId: Int): ShuffleMapStage = {
+  shuffleIdToMapStage.get(shuffleDep.shuffleId) match {
+    case Some(stage) =>
+      stage
+
+    case None =>
+      getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
+        if (!shuffleIdToMapStage.contains(dep.shuffleId)) {
+          createShuffleMapStage(dep, firstJobId)
         }
+      }
+      createShuffleMapStage(shuffleDep, firstJobId)
+  }
+}
+
+private def getMissingAncestorShuffleDependencies(
+    rdd: RDD[_]): Stack[ShuffleDependency[_, _, _]] = {
+  val ancestors = new Stack[ShuffleDependency[_, _, _]]
+  val visited = new HashSet[RDD[_]]
+  val waitingForVisit = new Stack[RDD[_]]
+  waitingForVisit.push(rdd)
+  while (waitingForVisit.nonEmpty) {
+    val toVisit = waitingForVisit.pop()
+    if (!visited(toVisit)) {
+      visited += toVisit
+      getShuffleDependencies(toVisit).foreach { shuffleDep =>
+        if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
+          ancestors.push(shuffleDep)
+          waitingForVisit.push(shuffleDep.rdd)
+        } // Otherwise, the dependency and its ancestors have already been registered.
       }
     }
   }
-  waitingForVisit.push(stage.rdd)
-  while (waitingForVisit.nonEmpty) {
-    visit(waitingForVisit.pop())
-  }
-  missing.toList
+  ancestors
 }
-```
 
-```Scala
+def createShuffleMapStage(shuffleDep: ShuffleDependency[_, _, _], jobId: Int): ShuffleMapStage = {
+  val rdd = shuffleDep.rdd
+  val numTasks = rdd.partitions.length
+  val parents = getOrCreateParentStages(rdd, jobId)
+  val id = nextStageId.getAndIncrement()
+  val stage = new ShuffleMapStage(id, rdd, numTasks, parents, jobId, rdd.creationSite, shuffleDep)
 
-private[scheduler] def handleMapStageSubmitted(jobId: Int,
-    dependency: ShuffleDependency[_, _, _],
-    callSite: CallSite,
-    listener: JobListener,
-    properties: Properties) {
-  // Submitting this map stage might still require the creation of some parent stages, so make
-  // sure that happens.
-  var finalStage: ShuffleMapStage = null
-  try {
-    // New stage creation may throw an exception if, for example, jobs are run on a
-    // HadoopRDD whose underlying HDFS files have been deleted.
-    finalStage = getOrCreateShuffleMapStage(dependency, jobId)
-  } catch {
-    case e: Exception =>
-      logWarning("Creating new stage failed due to exception - job: " + jobId, e)
-      listener.jobFailed(e)
-      return
-  }
+  stageIdToStage(id) = stage
+  shuffleIdToMapStage(shuffleDep.shuffleId) = stage
+  updateJobIdStageIdMaps(jobId, stage)
 
-  val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
-  clearCacheLocs()
-  logInfo("Got map stage job %s (%s) with %d output partitions".format(
-    jobId, callSite.shortForm, dependency.rdd.partitions.length))
-  logInfo("Final stage: " + finalStage + " (" + finalStage.name + ")")
-  logInfo("Parents of final stage: " + finalStage.parents)
-  logInfo("Missing parents: " + getMissingParentStages(finalStage))
-
-  val jobSubmissionTime = clock.getTimeMillis()
-  jobIdToActiveJob(jobId) = job
-  activeJobs += job
-  finalStage.addActiveJob(job)
-  val stageIds = jobIdToStageIds(jobId).toArray
-  val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
-  listenerBus.post(
-    SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
-  submitStage(finalStage)
-
-  // If the whole stage has already finished, tell the listener and remove it
-  if (finalStage.isAvailable) {
-    markMapStageJobAsFinished(job, mapOutputTracker.getStatistics(dependency))
-  }
+  // ... ignore some codes
+  stage
 }
 
 ```
 
+上面的几个函数是DAGScheduler根据宽依赖切分Stage的核心过程，该过程采用递归调用的方法，比较绕。看图边看图边分析下具体过程。
+
+![](../img/architecture/Spark-DAGScheduler-3.png)
 
 ```Scala
 /** Submits stage, but first recursively submits any missing parents. */
