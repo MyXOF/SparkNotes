@@ -66,7 +66,6 @@ def submitJob[T, U](
     callSite: CallSite,
     resultHandler: (Int, U) => Unit,
     properties: Properties): JobWaiter[U] = {
-  // Check to make sure we are not launching a task on a partition that does not exist.
   val maxPartitions = rdd.partitions.length
   partitions.find(p => p >= maxPartitions || p < 0).foreach { p =>
     throw new IllegalArgumentException(
@@ -76,7 +75,6 @@ def submitJob[T, U](
 
   val jobId = nextJobId.getAndIncrement()
   if (partitions.size == 0) {
-    // Return immediately if the job is running 0 tasks
     return new JobWaiter[U](this, jobId, 0, resultHandler)
   }
 
@@ -104,7 +102,6 @@ private[spark] class JobWaiter[T](
   ... ignore some codes
   */
   override def taskSucceeded(index: Int, result: Any): Unit = {
-    // resultHandler call must be synchronized in case resultHandler itself is not thread safe.
     synchronized {
       resultHandler(index, result.asInstanceOf[T])
     }
@@ -123,7 +120,7 @@ private[spark] class JobWaiter[T](
 
 对于创建好的JobWaiter，根据DAGSchedulerEvent中定义的事件类型创建“提交任务事件”，也就是代码里面看到的
 
-```
+```scala
 JobSubmitted(jobId, rdd, func2, partitions.toArray, callSite,
    waiter, SerializationUtils.clone(properties))
 ```
@@ -153,21 +150,6 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
     // ... ignore some codes
     case ResubmitFailedStages =>
       dagScheduler.resubmitFailedStages()
-  }
-
-  override def onError(e: Throwable): Unit = {
-    logError("DAGSchedulerEventProcessLoop failed; shutting down SparkContext", e)
-    try {
-      dagScheduler.doCancelAllJobs()
-    } catch {
-      case t: Throwable => logError("DAGScheduler failed to cancel all jobs.", t)
-    }
-    dagScheduler.sc.stopInNewThread()
-  }
-
-  override def onStop(): Unit = {
-    // Cancel any active jobs in postStop hook
-    dagScheduler.cleanUpAfterSchedulerStop()
   }
 }
 ```
@@ -209,7 +191,7 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
 
 ```
 
-handleJobSubmitted方法里面首先根据输入的rdd // TODO
+handleJobSubmitted方法里面首先根据输入的rdd创建好Result Stage，这部分过程相对复杂，下面将结合代码和流程图分析。
 
 
 ```scala
@@ -272,6 +254,7 @@ private def getOrCreateShuffleMapStage(
     case None =>
       getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
         if (!shuffleIdToMapStage.contains(dep.shuffleId)) {
+          // 这里仅仅是创建了shuffleMapStage并注册，并不作为返回，只有下面一个真正返回
           createShuffleMapStage(dep, firstJobId)
         }
       }
@@ -317,9 +300,64 @@ def createShuffleMapStage(shuffleDep: ShuffleDependency[_, _, _], jobId: Int): S
 
 ```
 
+getOrCreateShuffleMapStage方法是将输入的宽依赖，判断所对应的ShuffleMapStage是否已经创建了，如果没有的话，首先将他的所有祖先创建ShuffleMapStage，然后在创建自己的ShuffleMapStage并返回
+
+getMissingAncestorShuffleDependencies方法负责找到输入rdd的所有祖先里的宽依赖rdd
+
+createShuffleMapStage负责对于输入的宽依赖，建立ShuffleMapStage，这里还会递归调用getOrCreateParentStages找到并建立祖先的ShuffleMapStage
+
 上面的几个函数是DAGScheduler根据宽依赖切分Stage的核心过程，该过程采用递归调用的方法，比较绕。看图边看图边分析下具体过程。
 
 ![](../img/architecture/Spark-DAGScheduler-3.png)
+
+举例分析这个过程，下图中红色的箭头表示宽依赖，黑色的箭头表示窄依赖
+
+![](../img/architecture/Spark-DAGScheduler-4.png)
+
+首先从RDD A出发，调用createResultStage方法，该方法中调用getOrCreateParentStages方法，首选获取到所有的宽依赖，这里是RDD B和RDD D。
+
+先看RDD B
+
+1. 将其作为参数输入到getOrCreateShuffleMapStage方法
+
+  1.1. 判断这个宽依赖是否已经注册，显然没有
+
+  1.2. 这里调用getMissingAncestorShuffleDependencies找到他的祖先宽依赖，也没有
+
+  1.3. 那么现在调用getOrCreateShuffleMapStage方法
+
+    1.3.1 getOrCreateShuffleMapStage方法里面会调用getOrCreateShuffleMapStage找到所有的祖先ShuffleMapStage，这里也没有
+
+    1.3.2 最后直接创建一个ShuffleMapStage，这里编号记为0，包含RDD C和RDD D。
+
+2. 将ShuffleMapStage 0返回个给最上层getOrCreateParentStages方法里面数组里面的一个值
+
+再看RDD D，这个相对就比较麻烦了，涉及了递归调用。
+
+1. 一开始将它作为参数传入到getOrCreateShuffleMapStage中，
+
+  1.1 首先判断这个宽依赖是否已经注册，显然没有，
+
+  1.2 这里调用getMissingAncestorShuffleDependencies找到他的祖先宽依赖，只有RDD F
+
+    1.2.1 针对RDD F作为输入调用createShuffleMapStage方法
+
+      1.2.1.1 该方法里面首先找到他的祖先依赖，这里没有
+
+      1.2.1.2 那么就可以构建一个包含RDD G和RDD F的ShuffleMapStage，编号记为1。
+
+  1.3 然后回到之间的getOrCreateShuffleMapStage的方法，刚才是调用了getMissingAncestorShuffleDependencies方法，现在针对RDD D代用createShuffleMapStage
+
+    1.3.1 针对RDD D作为输入调用createShuffleMapStage方法
+
+      1.3.1.1 该方法里面首先找到他的祖先依赖，这里是刚才构建的包含RDD G个RDD F的ShuffleMapStage 1
+
+      1.3.1.2之后就可以构建一个包含RDD G和RDD F的ShuffleMapStage，编号记为2。它的祖先是ShuffleMapStage 1
+
+到这里过程算是结束了，生成了一个ResultStage和三个ShuffleMapStage，如下图。
+
+![](../img/architecture/Spark-DAGScheduler-5.png)
+
 
 ```Scala
 /** Submits stage, but first recursively submits any missing parents. */
