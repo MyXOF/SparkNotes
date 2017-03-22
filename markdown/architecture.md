@@ -359,6 +359,29 @@ createShuffleMapStage负责对于输入的宽依赖，建立ShuffleMapStage，�
 ![](../img/architecture/Spark-DAGScheduler-5.png)
 
 
+上述流程结束之后，在回到最开始的handleJobSubmitted方法，第二步是创建ActiveJob，将它交给监听总线，最后调用submitStage方法
+
+```Scala
+private[scheduler] def handleJobSubmitted(jobId: Int,
+    finalRDD: RDD[_],
+    func: (TaskContext, Iterator[_]) => _,
+    partitions: Array[Int],
+    callSite: CallSite,
+    listener: JobListener,
+    properties: Properties) {
+  // ... ignore some codes
+
+  val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
+  clearCacheLocs()
+  // ... ignore some codes
+  listenerBus.post(
+    SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
+  submitStage(finalStage)
+}
+```
+
+submitStage方法主要将输入的Stage按照先后顺序一个个submit，先提交祖先Stage，在提交当前Stage。
+
 ```Scala
 /** Submits stage, but first recursively submits any missing parents. */
 private def submitStage(stage: Stage) {
@@ -382,6 +405,39 @@ private def submitStage(stage: Stage) {
     abortStage(stage, "No active job for stage " + stage.id, None)
   }
 }
+
+private def getMissingParentStages(stage: Stage): List[Stage] = {
+  val missing = new HashSet[Stage]
+  val visited = new HashSet[RDD[_]]
+  // We are manually maintaining a stack here to prevent StackOverflowError
+  // caused by recursively visiting
+  val waitingForVisit = new Stack[RDD[_]]
+  def visit(rdd: RDD[_]) {
+    if (!visited(rdd)) {
+      visited += rdd
+      val rddHasUncachedPartitions = getCacheLocs(rdd).contains(Nil)
+      if (rddHasUncachedPartitions) {
+        for (dep <- rdd.dependencies) {
+          dep match {
+            case shufDep: ShuffleDependency[_, _, _] =>
+              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
+              if (!mapStage.isAvailable) {
+                missing += mapStage
+              }
+            case narrowDep: NarrowDependency[_] =>
+              waitingForVisit.push(narrowDep.rdd)
+          }
+        }
+      }
+    }
+  }
+  waitingForVisit.push(stage.rdd)
+  while (waitingForVisit.nonEmpty) {
+    visit(waitingForVisit.pop())
+  }
+  missing.toList
+}
+
 ```
 
 
@@ -518,6 +574,66 @@ private def submitMissingTasks(stage: Stage, jobId: Int) {
     logDebug(debugString)
 
     submitWaitingChildStages(stage)
+  }
+}
+
+/**
+ * Check for waiting stages which are now eligible for resubmission.
+ * Submits stages that depend on the given parent stage. Called when the parent stage completes
+ * successfully.
+ */
+private def submitWaitingChildStages(parent: Stage) {
+  logTrace(s"Checking if any dependencies of $parent are now runnable")
+  logTrace("running: " + runningStages)
+  logTrace("waiting: " + waitingStages)
+  logTrace("failed: " + failedStages)
+  val childStages = waitingStages.filter(_.parents.contains(parent)).toArray
+  waitingStages --= childStages
+  for (stage <- childStages.sortBy(_.firstJobId)) {
+    submitStage(stage)
+  }
+}
+
+private[scheduler] def handleMapStageSubmitted(jobId: Int,
+    dependency: ShuffleDependency[_, _, _],
+    callSite: CallSite,
+    listener: JobListener,
+    properties: Properties) {
+  // Submitting this map stage might still require the creation of some parent stages, so make
+  // sure that happens.
+  var finalStage: ShuffleMapStage = null
+  try {
+    // New stage creation may throw an exception if, for example, jobs are run on a
+    // HadoopRDD whose underlying HDFS files have been deleted.
+    finalStage = getOrCreateShuffleMapStage(dependency, jobId)
+  } catch {
+    case e: Exception =>
+      logWarning("Creating new stage failed due to exception - job: " + jobId, e)
+      listener.jobFailed(e)
+      return
+  }
+
+  val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
+  clearCacheLocs()
+  logInfo("Got map stage job %s (%s) with %d output partitions".format(
+    jobId, callSite.shortForm, dependency.rdd.partitions.length))
+  logInfo("Final stage: " + finalStage + " (" + finalStage.name + ")")
+  logInfo("Parents of final stage: " + finalStage.parents)
+  logInfo("Missing parents: " + getMissingParentStages(finalStage))
+
+  val jobSubmissionTime = clock.getTimeMillis()
+  jobIdToActiveJob(jobId) = job
+  activeJobs += job
+  finalStage.addActiveJob(job)
+  val stageIds = jobIdToStageIds(jobId).toArray
+  val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
+  listenerBus.post(
+    SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
+  submitStage(finalStage)
+
+  // If the whole stage has already finished, tell the listener and remove it
+  if (finalStage.isAvailable) {
+    markMapStageJobAsFinished(job, mapOutputTracker.getStatistics(dependency))
   }
 }
 
