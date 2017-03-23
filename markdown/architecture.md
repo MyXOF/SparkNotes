@@ -455,5 +455,15 @@ private[scheduler] def handleTaskCompletion(event: CompletionEvent) {
 
 ![](../img/architecture/Spark-DAGScheduler-5.png)
 
+* handleJobSubmitted里面得到result stage，生成ActiveJob并调用submitStage方法提交该调度阶段
+* 首先调用getMissingParentStages方法看它的祖先是否已经提交了，ShuffleMapStage 0 和ShuffleMapStage 2都没有提交
+* 递归调用submitStage方法
+	* ShuffleMapStage 0 没有祖先依赖，调用submitMissingTasks方法，生成任务并执行
+		* 这里尽管ShuffleMapStage 0所对应的Task执行完会调用submitWaitingChildStages方法，但是因为对于result stage来说，他的另一个依赖ShuffleMapStage 1还没有做，所以这里result stage还是会等待
+	* ShuffleMapStage 2 有祖先依赖ShuffleMapStage 1，递归调用submitStage方法
+		* ShuffleMapStage 1 没有祖先依赖，调用submitMissingTasks方法，生成任务并执行
+		* 执行完成之后调用submitWaitingChildStages方法，提交ShuffleMapStage 
+	* ShuffleMapStage 2的祖先依赖已经完成，那么submitMissingTasks方法里面将提交自己生成任务并执行
+* 执行完成之后调用submitWaitingChildStages方法，提交result stage，result stage已经没有没有提交的祖先依赖，那么这个时候就可以提交给task scheduler执行
 
-首先
+![](../img/architecture/Spark-DAGScheduler-7.png)
