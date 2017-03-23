@@ -173,20 +173,7 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
       listener.jobFailed(e)
       return
   }
-
-  val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
-  clearCacheLocs()
   // ... ignore some codes
-
-  val jobSubmissionTime = clock.getTimeMillis()
-  jobIdToActiveJob(jobId) = job
-  activeJobs += job
-  finalStage.setActiveJob(job)
-  val stageIds = jobIdToStageIds(jobId).toArray
-  val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
-  listenerBus.post(
-    SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
-  submitStage(finalStage)
 }
 
 ```
@@ -262,25 +249,10 @@ private def getOrCreateShuffleMapStage(
   }
 }
 
+// 获取所有祖先中的宽依赖
 private def getMissingAncestorShuffleDependencies(
     rdd: RDD[_]): Stack[ShuffleDependency[_, _, _]] = {
-  val ancestors = new Stack[ShuffleDependency[_, _, _]]
-  val visited = new HashSet[RDD[_]]
-  val waitingForVisit = new Stack[RDD[_]]
-  waitingForVisit.push(rdd)
-  while (waitingForVisit.nonEmpty) {
-    val toVisit = waitingForVisit.pop()
-    if (!visited(toVisit)) {
-      visited += toVisit
-      getShuffleDependencies(toVisit).foreach { shuffleDep =>
-        if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
-          ancestors.push(shuffleDep)
-          waitingForVisit.push(shuffleDep.rdd)
-        } // Otherwise, the dependency and its ancestors have already been registered.
-      }
-    }
-  }
-  ancestors
+// ... ignore some codes
 }
 
 def createShuffleMapStage(shuffleDep: ShuffleDependency[_, _, _], jobId: Int): ShuffleMapStage = {
@@ -352,7 +324,7 @@ createShuffleMapStage负责对于输入的宽依赖，建立ShuffleMapStage，�
 
       1.3.1.1 该方法里面首先找到他的祖先依赖，这里是刚才构建的包含RDD G个RDD F的ShuffleMapStage 1
 
-      1.3.1.2之后就可以构建一个包含RDD G和RDD F的ShuffleMapStage，编号记为2。它的祖先是ShuffleMapStage 1
+      1.3.1.2 之后就可以构建一个包含RDD G和RDD F的ShuffleMapStage，编号记为2。它的祖先是ShuffleMapStage 1
 
 到这里过程算是结束了，生成了一个ResultStage和三个ShuffleMapStage，如下图。
 
@@ -380,7 +352,7 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
 }
 ```
 
-submitStage方法主要将输入的Stage按照先后顺序一个个submit，先提交祖先Stage，在提交当前Stage。
+submitStage方法主要将输入的Stage按照先后顺序一个个submit，先提交祖先Stage，再提交当前Stage。
 
 ```Scala
 /** Submits stage, but first recursively submits any missing parents. */
@@ -406,40 +378,20 @@ private def submitStage(stage: Stage) {
   }
 }
 
+// 获取上一层祖先的Stage
 private def getMissingParentStages(stage: Stage): List[Stage] = {
-  val missing = new HashSet[Stage]
-  val visited = new HashSet[RDD[_]]
-  // We are manually maintaining a stack here to prevent StackOverflowError
-  // caused by recursively visiting
-  val waitingForVisit = new Stack[RDD[_]]
-  def visit(rdd: RDD[_]) {
-    if (!visited(rdd)) {
-      visited += rdd
-      val rddHasUncachedPartitions = getCacheLocs(rdd).contains(Nil)
-      if (rddHasUncachedPartitions) {
-        for (dep <- rdd.dependencies) {
-          dep match {
-            case shufDep: ShuffleDependency[_, _, _] =>
-              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
-              if (!mapStage.isAvailable) {
-                missing += mapStage
-              }
-            case narrowDep: NarrowDependency[_] =>
-              waitingForVisit.push(narrowDep.rdd)
-          }
-        }
-      }
-    }
-  }
-  waitingForVisit.push(stage.rdd)
-  while (waitingForVisit.nonEmpty) {
-    visit(waitingForVisit.pop())
-  }
-  missing.toList
+// ... ignore some codes
 }
 
 ```
 
+代码中首先判断一个Job是否合法
+
+* 不合法的话需要终止当前Stage
+* 合法的话再判断是否可以提交该Stage
+	* 这一步通过之后，调用getMissingParentStages获取上一层的所有Stage
+		* 如果上一层的所有Stage为空，则调用submitMissingTasks提交当前Stage作为任务
+		* 上一层Stage不为空，先提交祖先Stage，把自身加入到等待队列中
 
 ```Scala
 /** Called when stage's parents are available and we can now do its task. */
@@ -562,16 +514,7 @@ private def submitMissingTasks(stage: Stage, jobId: Int) {
     // the stage as completed here in case there are no tasks to run
     markStageAsFinished(stage, None)
 
-    val debugString = stage match {
-      case stage: ShuffleMapStage =>
-        s"Stage ${stage} is actually done; " +
-          s"(available: ${stage.isAvailable}," +
-          s"available outputs: ${stage.numAvailableOutputs}," +
-          s"partitions: ${stage.numPartitions})"
-      case stage : ResultStage =>
-        s"Stage ${stage} is actually done; (partitions: ${stage.numPartitions})"
-    }
-    logDebug(debugString)
+	// ... ignore some codes
 
     submitWaitingChildStages(stage)
   }
