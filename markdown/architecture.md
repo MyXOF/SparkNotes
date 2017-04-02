@@ -578,6 +578,8 @@ override def run(): Unit = {
     } finally {
       // ... ignore some codes
     }
+
+    // ... ignore some codes
 }
 ```
 
@@ -615,37 +617,16 @@ override def runTask(context: TaskContext): U = {
 
 ### 获取结果
 
+上面的run方法比较长，现在看第二部分，主要根据结果的大小将数据进行传输
+* 超过最大值maxResultSize(默认1GB)，丢弃，之间返回taskID
+* 结果在MIN(1MB, MIN(128MB, user-defined MB)) ~ 1GB 之间，会把该结果以taskId为编号存到BlockManager中，把blockId发送回去
+* 否则，将结果直接返回
+
+最后发送任务执行完的消息execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
 
 ```
 override def run(): Unit = {
     // ... ignore some codes
-    val taskFinish = System.currentTimeMillis()
-    val taskFinishCpu = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
-      threadMXBean.getCurrentThreadCpuTime
-    } else 0L
-
-    // If the task has been killed, let's fail it.
-    if (task.killed) {
-      throw new TaskKilledException
-    }
-
-    val resultSer = env.serializer.newInstance()
-    val beforeSerialization = System.currentTimeMillis()
-    val valueBytes = resultSer.serialize(value)
-    val afterSerialization = System.currentTimeMillis()
-
-    // Deserialization happens in two parts: first, we deserialize a Task object, which
-    // includes the Partition. Second, Task.run() deserializes the RDD and function to be run.
-    task.metrics.setExecutorDeserializeTime(
-      (taskStart - deserializeStartTime) + task.executorDeserializeTime)
-    task.metrics.setExecutorDeserializeCpuTime(
-      (taskStartCpu - deserializeStartCpuTime) + task.executorDeserializeCpuTime)
-    // We need to subtract Task.run()'s deserialization time to avoid double-counting
-    task.metrics.setExecutorRunTime((taskFinish - taskStart) - task.executorDeserializeTime)
-    task.metrics.setExecutorCpuTime(
-      (taskFinishCpu - taskStartCpu) - task.executorDeserializeCpuTime)
-    task.metrics.setJvmGCTime(computeTotalGcTime() - startGCTime)
-    task.metrics.setResultSerializationTime(afterSerialization - beforeSerialization)
 
     // Note: accumulator updates must be collected after TaskMetrics is updated
     val accumUpdates = task.collectAccumulatorUpdates()
@@ -679,61 +660,7 @@ override def run(): Unit = {
     execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
 
   } catch {
-    case ffe: FetchFailedException =>
-      val reason = ffe.toTaskFailedReason
-      setTaskFinishedAndClearInterruptStatus()
-      execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
-
-    case _: TaskKilledException =>
-      logInfo(s"Executor killed $taskName (TID $taskId)")
-      setTaskFinishedAndClearInterruptStatus()
-      execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
-
-    case _: InterruptedException if task.killed =>
-      logInfo(s"Executor interrupted and killed $taskName (TID $taskId)")
-      setTaskFinishedAndClearInterruptStatus()
-      execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
-
-    case CausedBy(cDE: CommitDeniedException) =>
-      val reason = cDE.toTaskFailedReason
-      setTaskFinishedAndClearInterruptStatus()
-      execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
-
-    case t: Throwable =>
-      // Attempt to exit cleanly by informing the driver of our failure.
-      // If anything goes wrong (or this was a fatal exception), we will delegate to
-      // the default uncaught exception handler, which will terminate the Executor.
-      logError(s"Exception in $taskName (TID $taskId)", t)
-
-      // Collect latest accumulator values to report back to the driver
-      val accums: Seq[AccumulatorV2[_, _]] =
-        if (task != null) {
-          task.metrics.setExecutorRunTime(System.currentTimeMillis() - taskStart)
-          task.metrics.setJvmGCTime(computeTotalGcTime() - startGCTime)
-          task.collectAccumulatorUpdates(taskFailed = true)
-        } else {
-          Seq.empty
-        }
-
-      val accUpdates = accums.map(acc => acc.toInfo(Some(acc.value), None))
-
-      val serializedTaskEndReason = {
-        try {
-          ser.serialize(new ExceptionFailure(t, accUpdates).withAccums(accums))
-        } catch {
-          case _: NotSerializableException =>
-            // t is not serializable so just send the stacktrace
-            ser.serialize(new ExceptionFailure(t, accUpdates, false).withAccums(accums))
-        }
-      }
-      setTaskFinishedAndClearInterruptStatus()
-      execBackend.statusUpdate(taskId, TaskState.FAILED, serializedTaskEndReason)
-
-      // Don't forcibly exit unless the exception was inherently fatal, to avoid
-      // stopping other tasks unnecessarily.
-      if (Utils.isFatalError(t)) {
-        SparkUncaughtExceptionHandler.uncaughtException(t)
-      }
+    // ... ignore some codes
 
   } finally {
     runningTasks.remove(taskId)
@@ -743,4 +670,4 @@ override def run(): Unit = {
 
 
 
-### 获取执行结果
+![](../img/architecture/Spark-ReceiveResult.png)
