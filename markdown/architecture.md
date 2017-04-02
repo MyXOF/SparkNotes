@@ -1,7 +1,10 @@
 # 架构
 
+[TOC]
 
 ## 调度
+
+### 提交作业
 
 首先，当触发了rdd的action操作之后。将隐式的调用SparkContext中的runJob方法，这样便开始了整个调度过程
 
@@ -153,6 +156,8 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
   }
 }
 ```
+
+### 划分调度
 
 可以发现，尽管接收到了处理的消息，但是具体处理的方法仍然在DAGScheduler中完成，对于JobSubmitted事件，调用handleJobSubmitted方法
 
@@ -352,6 +357,8 @@ private[scheduler] def handleJobSubmitted(jobId: Int,
 }
 ```
 
+### 提交调度阶段
+
 submitStage方法主要将输入的Stage按照先后顺序一个个submit，先提交祖先Stage，再提交当前Stage。
 
 ```Scala
@@ -382,7 +389,6 @@ private def submitStage(stage: Stage) {
 private def getMissingParentStages(stage: Stage): List[Stage] = {
 // ... ignore some codes
 }
-
 ```
 
 代码中首先判断一个Job是否合法
@@ -397,6 +403,8 @@ private def getMissingParentStages(stage: Stage): List[Stage] = {
 这里看上去等待队列没有再被你访问过，貌似是提交了上一层的MapStage，其实在submitMissingTasks方法的最后还有一个submitWaitingChildStages方法，把当前任务的孩子任务提交，所以并没有遗漏。流程示意图如下
 
 ![](../img/architecture/Spark-DAGScheduler-6.png)
+
+### 提交任务
 
 ```Scala
 private def submitMissingTasks(stage: Stage, jobId: Int) {
@@ -462,8 +470,277 @@ private[scheduler] def handleTaskCompletion(event: CompletionEvent) {
 		* 这里尽管ShuffleMapStage 0所对应的Task执行完会调用submitWaitingChildStages方法，但是因为对于result stage来说，他的另一个依赖ShuffleMapStage 1还没有做，所以这里result stage还是会等待
 	* ShuffleMapStage 2 有祖先依赖ShuffleMapStage 1，递归调用submitStage方法
 		* ShuffleMapStage 1 没有祖先依赖，调用submitMissingTasks方法，生成任务并执行
-		* 执行完成之后调用submitWaitingChildStages方法，提交ShuffleMapStage 
+		* 执行完成之后调用submitWaitingChildStages方法，提交ShuffleMapStage
 	* ShuffleMapStage 2的祖先依赖已经完成，那么submitMissingTasks方法里面将提交自己生成任务并执行
 * 执行完成之后调用submitWaitingChildStages方法，提交result stage，result stage已经没有没有提交的祖先依赖，那么这个时候就可以提交给task scheduler执行
 
 ![](../img/architecture/Spark-DAGScheduler-7.png)
+
+
+### 执行任务
+
+至此DAGScheduler的使命到此结束，下面的工作由TaskScheduler接管。
+
+在调用TaskScheduler的submitTasks方法里面，最关键的是将要执行的任务发送给接口类backend，在集群模式下CoarseGrainedExecutorBackend收到该消息
+
+```scala
+override def submitTasks(taskSet: TaskSet) {
+  // ... ignore some codes
+  backend.reviveOffers()
+}
+```
+
+CoarseGrainedExecutorBackend里面通过RpcEndpointRef的send方法发送特定类型的消息，这里是"ReviveOffers"，然后在内部类DriverEndpoint里面实现处理机制，makeOffers方法中调用launchTasks，先将任务序列化好，再将消息发送给CoarseGrainedExecutorBackend
+
+```scala
+override def reviveOffers() {
+  driverEndpoint.send(ReviveOffers)
+}
+
+override def receive: PartialFunction[Any, Unit] = {
+  // .. ignore some codes
+  case ReviveOffers =>
+    makeOffers()
+}
+
+// Make fake resource offers on all executors
+private def makeOffers() {
+  // ... ingore some codes
+  launchTasks(scheduler.resourceOffers(workOffers))
+}
+
+// Launch tasks returned by a set of resource offers
+private def launchTasks(tasks: Seq[Seq[TaskDescription]]) {
+  for (task <- tasks.flatten) {
+    val serializedTask = ser.serialize(task)
+    if (serializedTask.limit >= maxRpcMessageSize) {
+      // ... ignore some codes
+    }
+    else {
+      // ... ignore some codes
+      executorData.executorEndpoint.send(LaunchTask(new SerializableBuffer(serializedTask)))
+    }
+  }
+}
+```
+
+一个消息被转发来转发去的也不嫌烦，到了CoarseGrainedExecutorBackend里面的receive函数，再让executor启动任务，调用launchTask方法，先初始化一个TaskRunner来封装任务，再放入到线程池中执行
+
+```scala
+override def receive: PartialFunction[Any, Unit] = {
+  case LaunchTask(data) =>
+    if (executor == null) {
+      exitExecutor(1, "Received LaunchTask command but executor was null")
+    } else {
+      val taskDesc = ser.deserialize[TaskDescription](data.value)
+      logInfo("Got assigned task " + taskDesc.taskId)
+      executor.launchTask(this, taskId = taskDesc.taskId, attemptNumber = taskDesc.attemptNumber,
+        taskDesc.name, taskDesc.serializedTask)
+    }
+}
+
+def launchTask(
+    context: ExecutorBackend,
+    taskId: Long,
+    attemptNumber: Int,
+    taskName: String,
+    serializedTask: ByteBuffer): Unit = {
+  val tr = new TaskRunner(context, taskId = taskId, attemptNumber = attemptNumber, taskName,
+    serializedTask)
+  runningTasks.put(taskId, tr)
+  threadPool.execute(tr)
+}
+```
+
+TaskRunner具体执行的方法在run()实现，先把各种文件、jar包反序列化，然后调用Task的runTask方法，由于Task是一个抽象类，具体实现是在ShuffleMapTask和ResultTask里面实现的
+
+```scala
+override def run(): Unit = {
+  // ... ignore some codes
+
+  try {
+    val (taskFiles, taskJars, taskProps, taskBytes) =
+      Task.deserializeWithDependencies(serializedTask)
+
+    // Must be set before updateDependencies() is called, in case fetching dependencies
+    // requires access to properties contained within (e.g. for access control).
+    Executor.taskDeserializationProps.set(taskProps)
+
+    // ... ignore some codes
+    var threwException = true
+    val value = try {
+      val res = task.run(
+        taskAttemptId = taskId,
+        attemptNumber = attemptNumber,
+        metricsSystem = env.metricsSystem)
+      threwException = false
+      res
+    } finally {
+      // ... ignore some codes
+    }
+}
+```
+
+
+ShuffleMapTask的返回的是一个MapStatus对象，包含相关的存储信息(数据文件的位置)
+```scala
+// ShuffleMapTask
+override def runTask(context: TaskContext): MapStatus = {
+  // ... ignore some codes
+
+  var writer: ShuffleWriter[Any, Any] = null
+  try {
+    val manager = SparkEnv.get.shuffleManager
+    writer = manager.getWriter[Any, Any](dep.shuffleHandle, partitionId, context)
+    writer.write(rdd.iterator(partition, context).asInstanceOf[Iterator[_ <: Product2[Any, Any]]])
+    writer.stop(success = true).get
+  } catch {
+    // ... ignore some codes
+}
+```
+
+ResultTask返回的是func函数计算结果
+```scala
+// ResultTask
+override def runTask(context: TaskContext): U = {
+  // ... ignore some codes
+  func(context, rdd.iterator(partition, context))
+}
+```
+
+到这里调度环节基本结束了，画一张图总结一下整个流程
+
+![](../img/architecture/Spark-ExecuteJob.png)
+
+
+### 获取结果
+
+
+```
+override def run(): Unit = {
+    // ... ignore some codes
+    val taskFinish = System.currentTimeMillis()
+    val taskFinishCpu = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime
+    } else 0L
+
+    // If the task has been killed, let's fail it.
+    if (task.killed) {
+      throw new TaskKilledException
+    }
+
+    val resultSer = env.serializer.newInstance()
+    val beforeSerialization = System.currentTimeMillis()
+    val valueBytes = resultSer.serialize(value)
+    val afterSerialization = System.currentTimeMillis()
+
+    // Deserialization happens in two parts: first, we deserialize a Task object, which
+    // includes the Partition. Second, Task.run() deserializes the RDD and function to be run.
+    task.metrics.setExecutorDeserializeTime(
+      (taskStart - deserializeStartTime) + task.executorDeserializeTime)
+    task.metrics.setExecutorDeserializeCpuTime(
+      (taskStartCpu - deserializeStartCpuTime) + task.executorDeserializeCpuTime)
+    // We need to subtract Task.run()'s deserialization time to avoid double-counting
+    task.metrics.setExecutorRunTime((taskFinish - taskStart) - task.executorDeserializeTime)
+    task.metrics.setExecutorCpuTime(
+      (taskFinishCpu - taskStartCpu) - task.executorDeserializeCpuTime)
+    task.metrics.setJvmGCTime(computeTotalGcTime() - startGCTime)
+    task.metrics.setResultSerializationTime(afterSerialization - beforeSerialization)
+
+    // Note: accumulator updates must be collected after TaskMetrics is updated
+    val accumUpdates = task.collectAccumulatorUpdates()
+    // TODO: do not serialize value twice
+    val directResult = new DirectTaskResult(valueBytes, accumUpdates)
+    val serializedDirectResult = ser.serialize(directResult)
+    val resultSize = serializedDirectResult.limit
+
+    // directSend = sending directly back to the driver
+    val serializedResult: ByteBuffer = {
+      if (maxResultSize > 0 && resultSize > maxResultSize) {
+        logWarning(s"Finished $taskName (TID $taskId). Result is larger than maxResultSize " +
+          s"(${Utils.bytesToString(resultSize)} > ${Utils.bytesToString(maxResultSize)}), " +
+          s"dropping it.")
+        ser.serialize(new IndirectTaskResult[Any](TaskResultBlockId(taskId), resultSize))
+      } else if (resultSize > maxDirectResultSize) {
+        val blockId = TaskResultBlockId(taskId)
+        env.blockManager.putBytes(
+          blockId,
+          new ChunkedByteBuffer(serializedDirectResult.duplicate()),
+          StorageLevel.MEMORY_AND_DISK_SER)
+        logInfo(
+          s"Finished $taskName (TID $taskId). $resultSize bytes result sent via BlockManager)")
+        ser.serialize(new IndirectTaskResult[Any](blockId, resultSize))
+      } else {
+        logInfo(s"Finished $taskName (TID $taskId). $resultSize bytes result sent to driver")
+        serializedDirectResult
+      }
+    }
+
+    execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
+
+  } catch {
+    case ffe: FetchFailedException =>
+      val reason = ffe.toTaskFailedReason
+      setTaskFinishedAndClearInterruptStatus()
+      execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
+
+    case _: TaskKilledException =>
+      logInfo(s"Executor killed $taskName (TID $taskId)")
+      setTaskFinishedAndClearInterruptStatus()
+      execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
+
+    case _: InterruptedException if task.killed =>
+      logInfo(s"Executor interrupted and killed $taskName (TID $taskId)")
+      setTaskFinishedAndClearInterruptStatus()
+      execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
+
+    case CausedBy(cDE: CommitDeniedException) =>
+      val reason = cDE.toTaskFailedReason
+      setTaskFinishedAndClearInterruptStatus()
+      execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
+
+    case t: Throwable =>
+      // Attempt to exit cleanly by informing the driver of our failure.
+      // If anything goes wrong (or this was a fatal exception), we will delegate to
+      // the default uncaught exception handler, which will terminate the Executor.
+      logError(s"Exception in $taskName (TID $taskId)", t)
+
+      // Collect latest accumulator values to report back to the driver
+      val accums: Seq[AccumulatorV2[_, _]] =
+        if (task != null) {
+          task.metrics.setExecutorRunTime(System.currentTimeMillis() - taskStart)
+          task.metrics.setJvmGCTime(computeTotalGcTime() - startGCTime)
+          task.collectAccumulatorUpdates(taskFailed = true)
+        } else {
+          Seq.empty
+        }
+
+      val accUpdates = accums.map(acc => acc.toInfo(Some(acc.value), None))
+
+      val serializedTaskEndReason = {
+        try {
+          ser.serialize(new ExceptionFailure(t, accUpdates).withAccums(accums))
+        } catch {
+          case _: NotSerializableException =>
+            // t is not serializable so just send the stacktrace
+            ser.serialize(new ExceptionFailure(t, accUpdates, false).withAccums(accums))
+        }
+      }
+      setTaskFinishedAndClearInterruptStatus()
+      execBackend.statusUpdate(taskId, TaskState.FAILED, serializedTaskEndReason)
+
+      // Don't forcibly exit unless the exception was inherently fatal, to avoid
+      // stopping other tasks unnecessarily.
+      if (Utils.isFatalError(t)) {
+        SparkUncaughtExceptionHandler.uncaughtException(t)
+      }
+
+  } finally {
+    runningTasks.remove(taskId)
+  }
+}
+```
+
+
+
+### 获取执行结果
