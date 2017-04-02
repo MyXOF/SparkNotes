@@ -430,33 +430,6 @@ private def submitWaitingChildStages(parent: Stage) {
     submitStage(stage)
   }
 }
-
-private[scheduler] def handleTaskCompletion(event: CompletionEvent) {
-  // ... ignore some codes
-  val stage = stageIdToStage(task.stageId)
-  event.reason match {
-    case Success =>
-      stage.pendingPartitions -= task.partitionId
-      task match {
-        case smt: ShuffleMapTask =>
-            // ... ignore some codes
-            clearCacheLocs()
-            if (!shuffleStage.isAvailable) {
-              submitStage(shuffleStage)
-            } else {
-              if (shuffleStage.mapStageJobs.nonEmpty) {
-                val stats = mapOutputTracker.getStatistics(shuffleStage.shuffleDep)
-                for (job <- shuffleStage.mapStageJobs) {
-                  markMapStageJobAsFinished(job, stats)
-                }
-              }
-              submitWaitingChildStages(shuffleStage)
-            }
-          }
-      }
-
-  }
-}
 ```
 
 用上面的例子分析一下每个Stage提交的过程
@@ -661,13 +634,232 @@ override def run(): Unit = {
 
   } catch {
     // ... ignore some codes
-
   } finally {
     runningTasks.remove(taskId)
   }
 }
 ```
 
+statusUpdate消息被转发了两次，最后调用TaskScheder的statusUpdate方法
 
+```scala
+// CoarseGrainedExecutorBackend
+override def statusUpdate(taskId: Long, state: TaskState, data: ByteBuffer) {
+  val msg = StatusUpdate(executorId, taskId, state, data)
+  driver match {
+    case Some(driverRef) => driverRef.send(msg)
+    case None => logWarning(s"Drop $msg because has not yet connected to driver")
+  }
+}
+
+// CoarseGrainedSchedulerBackend
+override def receive: PartialFunction[Any, Unit] = {
+  case StatusUpdate(executorId, taskId, state, data) =>
+    scheduler.statusUpdate(taskId, state, data.value)
+    // ... ignore some codes
+  }
+```
+
+statusUpdate主要根据不同的执行状态采用不同的处理方法
+* 任务执行成功，调用taskResultGetter.enqueueSuccessfulTask方法
+  * 如果上面返回的是directResult，直接拿到结果
+  * 如果是IndirectTaskResult，需要根据blockID远程去取
+  * 拿到结果之后调用TaskScheduler的handleSuccessfulTask方法
+* 任务执行失败，调用taskResultGetter.enqueueFailedTask方法
+  * 需要对失败的任务重新提交并调度
+
+```scala
+// TaskSchedulerImpl
+def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer) {
+  var failedExecutor: Option[String] = None
+  var reason: Option[ExecutorLossReason] = None
+  synchronized {
+    try {
+      taskIdToTaskSetManager.get(tid) match {
+        case Some(taskSet) =>
+          // ... ignore some codes
+          if (TaskState.isFinished(state)) {
+            cleanupTaskState(tid)
+            taskSet.removeRunningTask(tid)
+            if (state == TaskState.FINISHED) {
+              taskResultGetter.enqueueSuccessfulTask(taskSet, tid, serializedData)
+            } else if (Set(TaskState.FAILED, TaskState.KILLED, TaskState.LOST).contains(state)) {
+              taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
+            }
+          }
+        // ... ignore some codes
+      }
+    } catch {
+      case e: Exception => logError("Exception in statusUpdate", e)
+    }
+  }
+  // ... ignore some codes
+}
+
+def enqueueSuccessfulTask(
+    taskSetManager: TaskSetManager,
+    tid: Long,
+    serializedData: ByteBuffer): Unit = {
+  getTaskResultExecutor.execute(new Runnable {
+    override def run(): Unit = Utils.logUncaughtExceptions {
+      try {
+        val (result, size) = serializer.get().deserialize[TaskResult[_]](serializedData) match {
+          case directResult: DirectTaskResult[_] =>
+            if (!taskSetManager.canFetchMoreResults(serializedData.limit())) {
+              return
+            }
+
+            directResult.value(taskResultSerializer.get())
+            (directResult, serializedData.limit())
+          case IndirectTaskResult(blockId, size) =>
+            if (!taskSetManager.canFetchMoreResults(size)) {
+              sparkEnv.blockManager.master.removeBlock(blockId)
+              return
+            }
+            logDebug("Fetching indirect task result for TID %s".format(tid))
+            scheduler.handleTaskGettingResult(taskSetManager, tid)
+            val serializedTaskResult = sparkEnv.blockManager.getRemoteBytes(blockId)
+            if (!serializedTaskResult.isDefined) {
+              scheduler.handleFailedTask(
+                taskSetManager, tid, TaskState.FINISHED, TaskResultLost)
+              return
+            }
+            val deserializedResult = serializer.get().deserialize[DirectTaskResult[_]](
+              serializedTaskResult.get.toByteBuffer)
+            deserializedResult.value(taskResultSerializer.get())
+            sparkEnv.blockManager.master.removeBlock(blockId)
+            (deserializedResult, size)
+        }
+        // ... ignore some codes
+        scheduler.handleSuccessfulTask(taskSetManager, tid, result)
+      } catch {
+        // ... ignore some codes
+      }
+    }
+  })
+}
+
+def enqueueFailedTask(taskSetManager: TaskSetManager, tid: Long, taskState: TaskState, serializedData: ByteBuffer) {
+  var reason : TaskFailedReason = UnknownReason
+  try {
+    getTaskResultExecutor.execute(new Runnable {
+      override def run(): Unit = Utils.logUncaughtExceptions {
+        val loader = Utils.getContextOrSparkClassLoader
+        try {
+          if (serializedData != null && serializedData.limit() > 0) {
+            reason = serializer.get().deserialize[TaskFailedReason](
+              serializedData, loader)
+          }
+        } catch {
+          case cnd: ClassNotFoundException =>
+            // Log an error but keep going here -- the task failed, so not catastrophic
+            // if we can't deserialize the reason.
+            logError(
+              "Could not deserialize TaskEndReason: ClassNotFound with classloader " + loader)
+          case ex: Exception => // No-op
+        }
+        scheduler.handleFailedTask(taskSetManager, tid, taskState, reason)
+      }
+    })
+  } catch {
+    case e: RejectedExecutionException if sparkEnv.isStopped =>
+      // ignore it
+  }
+}
+```
+
+如果一切正常，进入到handleSuccessfulTask方法，交给taskSetManager记性处理
+
+```scala
+// TaskSchedulerImpl
+def handleSuccessfulTask(
+    taskSetManager: TaskSetManager,
+    tid: Long,
+    taskResult: DirectTaskResult[_]): Unit = synchronized {
+  taskSetManager.handleSuccessfulTask(tid, taskResult)
+}
+
+// TaskSetManager
+def handleSuccessfulTask(tid: Long, result: DirectTaskResult[_]): Unit = {
+  // ... ignore some codes
+  sched.dagScheduler.taskEnded(tasks(index), Success, result.value(), result.accumUpdates, info)
+  // ... ignore some codes
+}
+
+// DAGScheduler
+def taskEnded(
+    task: Task[_],
+    reason: TaskEndReason,
+    result: Any,
+    accumUpdates: Seq[AccumulatorV2[_, _]],
+    taskInfo: TaskInfo): Unit = {
+  eventProcessLoop.post(
+    CompletionEvent(task, reason, result, accumUpdates, taskInfo))
+}
+```
+
+最终调用DAGScheduler中handleTaskCompletion方法
+
+如果任务是ShuffleMapTask，需要将计算结果告诉下游，具体做法是将上面IndirectResult或者DirectResult注册到mapOutputTracker中
+
+如果任务是ResultTask，那么将该任务标记为已经完成，清理掉所依赖的资源并通知总线
+
+```
+// DAGScheduler
+private[scheduler] def handleTaskCompletion(event: CompletionEvent) {
+  // ... ignore some codes
+  val stage = stageIdToStage(task.stageId)
+  event.reason match {
+    case Success =>
+      stage.pendingPartitions -= task.partitionId
+      task match {
+        case rt: ResultTask[_, _] =>
+          val resultStage = stage.asInstanceOf[ResultStage]
+          resultStage.activeJob match {
+            case Some(job) =>
+              if (!job.finished(rt.outputId)) {
+
+                if (job.numFinished == job.numPartitions) {
+                  markStageAsFinished(resultStage)
+                  cleanupStateForJobAndIndependentStages(job)
+                  listenerBus.post(
+                    SparkListenerJobEnd(job.jobId, clock.getTimeMillis(), JobSucceeded))
+                }
+                try {
+                  job.listener.taskSucceeded(rt.outputId, event.result)
+                } catch {
+                  case e: Exception =>
+                    job.listener.jobFailed(new SparkDriverExecutionException(e))
+                }
+              }
+            case None =>
+              logInfo("Ignoring result from " + rt + " because its job has finished")
+          }
+
+        case smt: ShuffleMapTask =>
+          // ... ignore some codes
+          if (runningStages.contains(shuffleStage) && shuffleStage.pendingPartitions.isEmpty) {
+            markStageAsFinished(shuffleStage)
+
+            mapOutputTracker.registerMapOutputs(
+              shuffleStage.shuffleDep.shuffleId,
+              shuffleStage.outputLocInMapOutputTrackerFormat(),
+              changeEpoch = true)
+
+          }
+          // ... ignore some codes
+      }
+    // ... ignore some codes
+  }
+}
+```
+
+最后总结下获取计算结果的流程图
 
 ![](../img/architecture/Spark-ReceiveResult.png)
+
+### 小结
+
+至此，Spark作业调度部分已经结束。当然，上面的分析省略了许多错误处理的机制，只是按照一切都正常的流程走了一遍。
+
+可以看到，在分布式的系统中，一方面实现某个最初设想的功能即便有一些困难，但是和实现容错处理机制比起来，工作量差了很多，同时容错处理也提高了分布式系统软件的开发门槛。Spark的数据模型是RDD，因此，在容错处理的时候相对变得容易些，只需要将数据重新计算一遍即可，不需要考虑数据这个时候怎么存储迁移等问题。好的设计往往能事半功倍。
