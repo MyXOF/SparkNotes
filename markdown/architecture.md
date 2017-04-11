@@ -303,7 +303,7 @@ createShuffleMapStage负责对于输入的宽依赖，建立ShuffleMapStage，�
 
   1.3. 那么现在调用getOrCreateShuffleMapStage方法
 
-    1.3.1 getOrCreateShuffleMapStage方法里面会调用getOrCreateShuffleMapStage找到所有的祖先ShuffleMapStage，这里也没有
+    1.3.1 getOrCreateShuffleMapStage方法里面会调用getMissingAncestorShuffleDependencies找到所有的祖先ShuffleMapStage，这里也没有
 
     1.3.2 最后直接创建一个ShuffleMapStage，这里编号记为0，包含RDD C和RDD D。
 
