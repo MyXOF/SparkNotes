@@ -8,6 +8,10 @@
 
 ## 架构篇
 
+### 消息通信
+
+// TODO
+
 ### 调度
 
 Spark的作业调度主要基于RDD的一系列操作构成的一个作业，然后在Executor中执行，调度中最后重要的是DAGScheduler和TaskScheduler调度器，DAG负责逻辑上的调度，Task负责具体任务的调度执行，大致流程如下：
