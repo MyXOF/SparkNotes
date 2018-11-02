@@ -1,3 +1,11 @@
+<!-- TOC -->
+
+- [概念](#概念)
+    - [运行时用到的概念](#运行时用到的概念)
+    - [调度中的概念](#调度中的概念)
+
+<!-- /TOC -->
+
 # 概念
 
 ## 运行时用到的概念
@@ -10,6 +18,7 @@
 * Standalone：Spark原生资源管理器，由Master负责资源管理
 * Hadoop Yarn：由Yarn中的ResourceManager负责资源管理，// TODO 听过但还没研究过
 * Mesos // TODO 还没了解过
+* K8S // TODO 还没了解过
 
 工作节点(Worker)：集群中任何可以运行Application代码的节点，在Standalone模式中就是Slave文件配置的Worker节点；在Spark on Yarn中就是NodeManager节点
 
