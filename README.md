@@ -1,5 +1,7 @@
 # SparkNotes
 
+[![Build Status](https://travis-ci.com/MyXOF/SparkNotes.svg?branch=master)](https://travis-ci.com/MyXOF/SparkNotes)
+
 Spark 2.0学习笔记
 
 主要结合Spark 2.3.2源码和《图解Spark 核心技术与案例实战》一书，记录对Spark系统的一些思考。
