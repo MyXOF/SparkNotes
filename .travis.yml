@@ -1,0 +1,20 @@
+dist: trusty
+
+sudo: required
+
+language: java
+
+jdk:
+  - oraclejdk8
+
+before_install:
+  - pip install --user codecov
+
+script: 
+# only SNAPSHOT version needs to do the following phase
+  - mvn cobertura:cobertura
+  - mvn clean test
+  
+after_success:
+  - bash <(curl -s https://codecov.io/bash) -t f81b9ad4-01cb-44cd-9f5b-778a12ba251d
+
