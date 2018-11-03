@@ -1,6 +1,7 @@
 <!-- TOC -->
 
 - [摘要](#摘要)
+    - [下载安装](#下载安装)
     - [Spark概念](#spark概念)
     - [RDD](#rdd)
     - [存储模型](#存储模型)
@@ -15,6 +16,11 @@
 # 摘要
 
 这里主要记录一下每一部分的简要概述
+
+## 下载安装
+
+在学习Spark之前，免不了需要手动下载Spark源码，手动编译，配置环境等步骤。[这里](https://github.com/MyXOF/SparkNotes/blob/master/markdown/install.md)介绍一下必要的步骤。
+
 
 ## Spark概念
 
