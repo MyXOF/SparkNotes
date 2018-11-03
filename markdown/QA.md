@@ -1,3 +1,10 @@
+<!-- TOC -->
+
+- [Q&A](#qa)
+    - [Q1:为什么Spark里面对数据的操作需要分为transform和action两种？](#q1为什么spark里面对数据的操作需要分为transform和action两种)
+
+<!-- /TOC -->
+
 # Q&A
 
 ## Q1:为什么Spark里面对数据的操作需要分为transform和action两种？
