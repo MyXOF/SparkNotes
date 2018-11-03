@@ -11,7 +11,7 @@ Spark 2.0学习笔记
 
 作图工具推荐一下[ProcessOn](https://www.processon.com/)网站，非常不错
 
-话不多说，请从[这里](https://github.com/MyXOF/SparkNotes/blob/master/markdown/README.md)开始吧。
+话不多说，请从[这里](https://github.com/MyXOF/SparkNotes/blob/master/doc/markdown/README.md)开始吧。
 
 ## 参考资料
 
